@@ -40,23 +40,22 @@ pub struct KeychainBackend;
 
 impl TokenBackend for KeychainBackend {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, TokenStoreError> {
-        let entry = crate::secrets::get_entry(key)?;
-        match entry.get_secret() {
+        match crate::secrets::load_secret(key) {
             Ok(bytes) => Ok(Some(decode_secret(bytes)?)),
             Err(keyring_core::Error::NoEntry) => Ok(None),
-            Err(e) => Err(e.into()),
+            Err(error) => Err(error.into()),
         }
     }
 
     fn set(&self, key: &str, value: &[u8]) -> Result<(), TokenStoreError> {
-        crate::secrets::get_entry(key)?.set_secret(&encode_secret(value))?;
+        crate::secrets::store_secret(key, &encode_secret(value))?;
         #[cfg(all(target_os = "linux", not(feature = "key-chain-file")))]
         crate::keyring_persistence::sync_after_write();
         Ok(())
     }
 
     fn remove(&self, key: &str) -> Result<(), TokenStoreError> {
-        deletion_result(crate::secrets::get_entry(key)?.delete_credential())?;
+        deletion_result(crate::secrets::delete_secret(key))?;
         #[cfg(all(target_os = "linux", not(feature = "key-chain-file")))]
         crate::keyring_persistence::sync_after_write();
         Ok(())
@@ -114,6 +113,42 @@ mod tests {
             assert!(matches!(error, TokenStoreError::Io(_)));
             assert!(!error.to_string().contains("synthetic-secret-never-print"));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_credentials_survive_a_new_process() {
+        if std::env::var_os("XODUS_CRED_CHILD").is_some() {
+            crate::secrets::init_secrets().expect("credential store");
+            let key = std::env::var("XODUS_CRED_KEY").expect("key");
+            let expected: usize = std::env::var("XODUS_CRED_LEN").expect("len").parse().expect("len");
+            let got = KeychainBackend.get(&key).expect("read").expect("present");
+            assert_eq!(got.len(), expected);
+            assert!(got.iter().all(|byte| *byte == 9));
+            return;
+        }
+        crate::secrets::init_secrets().expect("credential store");
+        let small_key = format!("test-small-{}", std::process::id());
+        let large_key = format!("test-large-{}", std::process::id());
+        KeychainBackend.set(&small_key, b"synthetic-small").expect("small");
+        assert_eq!(KeychainBackend.get(&small_key).expect("read").expect("present"), b"synthetic-small");
+        let small_file = crate::windows_credentials::credential_file(&small_key).expect("profile");
+        assert!(!small_file.exists());
+        let large = vec![9u8; 4_000];
+        KeychainBackend.set(&large_key, &large).expect("large");
+        let large_file = crate::windows_credentials::credential_file(&large_key).expect("profile");
+        assert!(large_file.is_file());
+        let status = std::process::Command::new(std::env::current_exe().expect("test exe"))
+            .env("XODUS_CRED_CHILD", "1")
+            .env("XODUS_CRED_KEY", &large_key)
+            .env("XODUS_CRED_LEN", "4000")
+            .arg("windows_credentials_survive_a_new_process")
+            .status()
+            .expect("child");
+        let _ = KeychainBackend.remove(&small_key);
+        let _ = KeychainBackend.remove(&large_key);
+        assert!(status.success());
+        assert!(!large_file.exists());
     }
 
     #[test]

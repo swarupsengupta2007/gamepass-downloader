@@ -24,7 +24,14 @@ pub fn init_secrets() -> Result<(), keyring_core::Error> {
             keyring_core::set_default_store(apple_native_keyring_store::keychain::Store::new()?);
         }
 
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(windows)]
+        {
+            let saved = crate::windows_credentials::read_sample_entries();
+            keyring_core::set_default_store(windows_native_keyring_store::Store::new()?);
+            crate::windows_credentials::import_sample_entries(saved);
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             let store = keyring_core::sample::Store::new_with_configuration(
                 &std::collections::HashMap::from([("persist", "true")]),
@@ -57,6 +64,39 @@ fn activate_desktop_keyring() {
 
 pub fn get_entry(user: &str) -> Result<keyring_core::Entry, keyring_core::Error> {
     keyring_core::Entry::new(SERVICE_NAME, user)
+}
+
+pub fn store_secret(user: &str, secret: &[u8]) -> Result<(), keyring_core::Error> {
+    #[cfg(all(windows, not(feature = "key-chain-file")))]
+    {
+        return crate::windows_credentials::store_secret(user, secret);
+    }
+    #[cfg(not(all(windows, not(feature = "key-chain-file"))))]
+    {
+        get_entry(user)?.set_secret(secret)
+    }
+}
+
+pub fn load_secret(user: &str) -> Result<Vec<u8>, keyring_core::Error> {
+    #[cfg(all(windows, not(feature = "key-chain-file")))]
+    {
+        return crate::windows_credentials::load_secret(user);
+    }
+    #[cfg(not(all(windows, not(feature = "key-chain-file"))))]
+    {
+        get_entry(user)?.get_secret()
+    }
+}
+
+pub fn delete_secret(user: &str) -> Result<(), keyring_core::Error> {
+    #[cfg(all(windows, not(feature = "key-chain-file")))]
+    {
+        return crate::windows_credentials::delete_secret(user);
+    }
+    #[cfg(not(all(windows, not(feature = "key-chain-file"))))]
+    {
+        get_entry(user)?.delete_credential()
+    }
 }
 
 pub fn destroy_secrets() {

@@ -11,6 +11,8 @@ pub mod keyring_unlock;
 pub mod licensing;
 pub mod models;
 pub mod secrets;
+#[cfg(all(windows, not(feature = "key-chain-file")))]
+mod windows_credentials;
 pub mod tokens;
 
 pub const XBOX_LIVE_PACKAGES_PC: &str = "https://packagespc.xboxlive.com";
