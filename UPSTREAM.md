@@ -16,7 +16,7 @@ The workspace is three layers. Each update replaces the bottom two and replays t
 
 Checked on 2026-10-30: all 45 patches match their `sha256` in the lock file and apply cleanly with `git apply` to the pinned commit. Comparing that rebuilt baseline with the workspace gives exactly the layer-3 list below (plus the `license`, `sp-license` and `download --dry-run` removals made after that comparison).
 
-Removed 2026-10-31 because the app does not use them: `crates/xodus-service/`, `README.md`, `assets/`, `docs/`, `scripts/`, `.github/`. They are part of layer 3 as deletions.
+Removed 2026-10-31 because the app does not use them: `crates/xodus-service/`, `README.md`, `assets/`, `docs/`, `scripts/`, `.github/`. They are part of layer 3 as deletions. A new `README.md` for this project took the upstream one's place the same day.
 
 ## The repository
 
@@ -115,7 +115,7 @@ Commit layer 3 in feature-sized commits rather than one, so a later replay confl
 | Library and profile | `xodus-cli/src/commands/library.rs`, `profile.rs` |
 | One exe and the window | `xodus-cli/src/lib.rs` (also the `License`, `SpLicense` and `Download` removals), `xodus-cli/src/commands.rs`, `xodus-cli/src/main.rs`, `crates/gamepass-gui/*`, `.cargo/config.toml`, `.cargo/msvc-static-crt.cmake`, `build.cmd` |
 | Unused upstream parts | `crates/xodus-service/`, `README.md`, `assets/`, `docs/`, `scripts/`, `.github/` (deleted) |
-| Project docs and repository settings | `AGENTS.md`, `HANDOFF.md`, `UPSTREAM.md`, `.gitattributes`, `.gitignore` |
+| Project docs and repository settings | `AGENTS.md`, `HANDOFF.md`, `UPSTREAM.md`, `.gitattributes`, `.gitignore`; `README.md` came in a later commit |
 | Lock file | `Cargo.lock` |
 
 Before relying on this, rebuild and run the tests (see [Check the result](#check-the-result)). The working files did not change, so the result should match the current build.
@@ -224,7 +224,7 @@ These are the places where upstream changes are most likely to collide with this
 | `xodus-cli/src/commands/profile.rs` | Also reads `legalCountry` from `accounts.xboxlive.com` and outputs only `country`. | Keep that field; the window uses it for the market. |
 | `xodus-cli/Cargo.toml`, `xodus/Cargo.toml` | `windows-sys`, `windows-native-keyring-store`. | Merge feature lists rather than replacing them. |
 | `.cargo/config.toml` | `+crt-static` for `x86_64-pc-windows-msvc`, and a CMake toolchain file for the static C runtime. | Keep both. If upstream adds `rustflags` for `x86_64`, add them to the Windows table too. The Windows table already repeats the AES flags, so they apply however Cargo combines the two tables. |
-| `crates/xodus-service/`, `README.md`, `assets/`, `docs/`, `scripts/`, `.github/` | Deleted; nothing in the build uses them. | Upstream edits come back as modify/delete conflicts. Keep them deleted (`git rm`). If upstream moves code the app needs into one of them, raise it with the project owner. |
+| `crates/xodus-service/`, `README.md`, `assets/`, `docs/`, `scripts/`, `.github/` | Deleted; nothing in the build uses them. | Upstream edits come back as modify/delete conflicts. Keep them deleted (`git rm`). If upstream moves code the app needs into one of them, raise it with the project owner. `README.md` is now this project's own: on a conflict keep ours (during a rebase, `git checkout --theirs README.md`). |
 | `crates/gamepass-gui/` | Not upstream. | Breaks only when `xodus-cli` command names, flags or JSON output change. Check `cli.rs` against `--help` and the JSON of `queue`, `account`, `profile`, `resolve-package`, `streaming --progress-json` and `adopt --json --log`. |
 
 Upstream also ships commands this project leaves alone: `run` (Linux/Wine), cloud saves, achievements. Take their changes as they come; they need to build, not work, on Windows.
