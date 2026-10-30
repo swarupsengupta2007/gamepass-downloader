@@ -5,6 +5,8 @@ use serde_json::{Value, json};
 use xodus::{models::{live::ExchangeUserTokenOutcome, secrets::Token, soap}, tokens::TokenManager};
 
 const PROFILE: &str = "https://profile.xboxlive.com/users/me/profile/settings?settings=Gamertag,PublicGamerpic";
+/// The account record; only `legalCountry` is read from it.
+const ACCOUNT: &str = "https://accounts.xboxlive.com/users/current/profile";
 const MAX_IMAGE: usize = 2 * 1024 * 1024;
 
 pub(super) async fn bounded(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>, &'static str> {
@@ -74,7 +76,7 @@ pub(super) async fn xbox_session(tokens: &TokenManager) -> Result<(reqwest::Clie
 
 async fn profile(tokens: &TokenManager) -> Result<Value, &'static str> {
     let (client, authorization, account) = xbox_session(tokens).await?;
-    let response = client.get(PROFILE).header("Authorization", authorization)
+    let response = client.get(PROFILE).header("Authorization", &authorization)
         .header("x-xbl-contract-version", "2").send().await.map_err(|_| "profile-request")?;
     let body = bounded(response, 128 * 1024).await?;
     let (gamertag, picture) = fields(&serde_json::from_slice(&body).map_err(|_| "profile-json")?)?;
@@ -85,8 +87,27 @@ async fn profile(tokens: &TokenManager) -> Result<Value, &'static str> {
             Err(_) => None,
         }
     } else { None };
+    let country = legal_country(&client, &authorization).await;
     if tokens.get_user().map_err(|_| "account-changed")?.username != account { return Err("account-changed"); }
-    Ok(json!({ "schema": 1, "account": account, "gamertag": gamertag, "gamerpicDataUrl": image }))
+    Ok(json!({ "schema": 1, "account": account, "gamertag": gamertag, "gamerpicDataUrl": image, "country": country }))
+}
+
+/// The account's country (two-letter code), the Store market it buys in.
+/// Optional: any failure leaves it out. Nothing else in the record is kept.
+async fn legal_country(client: &reqwest::Client, authorization: &str) -> Option<String> {
+    let response = client.get(ACCOUNT).header("Authorization", authorization)
+        .header("x-xbl-contract-version", "2").send().await.ok()?;
+    if !response.status().is_success() {
+        eprintln!("NEXUS_SESSION_DIAGNOSTIC_V1 account-country-refused {}", response.status().as_u16());
+        return None;
+    }
+    let body = bounded(response, 64 * 1024).await.ok()?;
+    country_code(&serde_json::from_slice(&body).ok()?)
+}
+
+fn country_code(value: &Value) -> Option<String> {
+    let code = value["legalCountry"].as_str()?;
+    (code.len() == 2 && code.bytes().all(|b| b.is_ascii_alphabetic())).then(|| code.to_ascii_uppercase())
 }
 
 pub async fn run(tokens: &TokenManager, json_output: bool) -> ExitCode {
@@ -127,5 +148,13 @@ mod tests {
         assert!(picture_url("https://evil.test/a").is_none());
         assert!(picture_url("https://user:secret@gamerpic.xboxlive.com/a").is_none());
         assert!(image_data(b"<svg/>").is_none());
+    }
+
+    #[test]
+    fn only_a_two_letter_legal_country_is_kept() {
+        assert_eq!(country_code(&json!({"legalCountry":"in","email":"private"})).as_deref(), Some("IN"));
+        assert_eq!(country_code(&json!({"legalCountry":"IND"})), None);
+        assert_eq!(country_code(&json!({"legalCountry":"1N"})), None);
+        assert_eq!(country_code(&json!({})), None);
     }
 }

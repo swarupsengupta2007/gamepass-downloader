@@ -94,6 +94,86 @@ impl Entitlements {
     }
 }
 
+const PLANS: &[&str] = &[
+    "CFQ7TTC0KGQ8",
+    "CFQ7TTC0KHS0",
+    "CFQ7TTC0P85B",
+    "CFQ7TTC0K5DJ",
+    "CFQ7TTC0K6L8",
+    "CFQ7TTC10QFD",
+];
+
+/// Walk `satisfiedByProductId` the way the Nexus library does.
+/// Subscription products, trials, shared copies, and unknown special licenses are omitted.
+fn access(
+    product_id: &str,
+    entries: &BTreeMap<String, Value>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<&'static str> {
+    let mut current = product_id.to_string();
+    let mut subscription = false;
+    let mut conditional = false;
+    let mut seen = HashSet::new();
+    for depth in 0..16 {
+        if !seen.insert(current.clone()) {
+            return None;
+        }
+        subscription |= PLANS.contains(&current.as_str());
+        let Some(item) = entries.get(&current) else {
+            return if depth == 0 {
+                None
+            } else if conditional {
+                Some("owned")
+            } else if subscription {
+                Some("gamepass")
+            } else {
+                Some("other")
+            };
+        };
+        if item["special"].as_bool() == Some(true) && item["isPositron"].as_bool() != Some(true) {
+            return None;
+        }
+        let expiry = item["endDate"]
+            .as_str()
+            .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok());
+        let active = item["status"] == "Active"
+            && item["isTrial"] == false
+            && item["sharingSource"] == "None"
+            && expiry.is_some_and(|when| when > now);
+        if !active {
+            return None;
+        }
+        conditional |= item["isPositron"].as_bool() == Some(true);
+        match item["satisfiedByProductId"].as_str() {
+            None if current == product_id && PLANS.contains(&current.as_str()) => return None,
+            None if conditional || !subscription => return Some("owned"),
+            None => return Some("gamepass"),
+            Some(parent) => current = parent.to_string(),
+        }
+    }
+    None
+}
+
+fn installable(entries: &BTreeMap<String, Value>, now: chrono::DateTime<chrono::Utc>) -> Vec<Value> {
+    let mut products: Vec<Value> = entries
+        .keys()
+        .filter_map(|id| match access(id, entries, now) {
+            Some(kind @ ("owned" | "gamepass")) => Some(json!({"productId": id, "access": kind})),
+            _ => None,
+        })
+        .collect();
+    products.sort_by(|left, right| {
+        let rank = |row: &Value| u8::from(row["access"] != "owned");
+        rank(left).cmp(&rank(right)).then_with(|| {
+            left["productId"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(right["productId"].as_str().unwrap_or(""))
+        })
+    });
+    products
+}
+
 fn diagnostic(stage: &'static str, status: u16, count: usize) {
     // Static stage + bounded numeric metadata only, never a response or account.
     eprintln!("NEXUS_LIBRARY_DIAGNOSTIC_V1 {stage} {status} {count}");
@@ -164,8 +244,11 @@ async fn query(tokens: &TokenManager, market: &str) -> Result<Value, &'static st
             all.finish();
             for (reason, count) in &all.reasons { diagnostic(reason, 0, *count); }
             diagnostic(if all.skipped > 0 { "partial" } else { "complete" }, 0, all.skipped);
+            let now = chrono::Utc::now();
+            let products = installable(&all.entries, now);
             return Ok(json!({"schema":1,"account":account,"market":market,
-                "checkedAt":chrono::Utc::now().to_rfc3339(),"skippedEntitlements":all.skipped,
+                "checkedAt":now.to_rfc3339(),"skippedEntitlements":all.skipped,
+                "products":products,
                 "entitlements":all.entries.into_values().collect::<Vec<_>>()}));
         }
     }
@@ -348,6 +431,79 @@ mod tests {
             else { assert_eq!(actual[field], value); }
         }
     }
+    fn classified(rows: Vec<(&str, Value)>) -> Vec<Value> {
+        let mut result = Entitlements::default();
+        result.add(&page(rows)).unwrap();
+        result.finish();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        installable(&result.entries, now)
+    }
+
+    fn labeled(rows: &[Value]) -> Vec<(String, String)> {
+        rows.iter()
+            .map(|row| {
+                (
+                    row["productId"].as_str().unwrap().to_owned(),
+                    row["access"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn marks_purchased_games_owned_and_subscription_children_game_pass() {
+        let mut bundled = valid();
+        bundled["satisfiedByProductId"] = json!(A);
+        let mut pass = valid();
+        pass["satisfiedByProductId"] = json!("CFQ7TTC0KGQ8");
+        let products = classified(vec![(A, valid()), (B, bundled), (C, pass), ("CFQ7TTC0KGQ8", valid())]);
+        assert_eq!(
+            labeled(&products),
+            vec![
+                (A.to_owned(), "owned".to_owned()),
+                (B.to_owned(), "owned".to_owned()),
+                (C.to_owned(), "gamepass".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn omits_subscriptions_trials_shared_expired_and_unresolved_sources() {
+        let plan = "CFQ7TTC0KGQ8";
+        let mut unknown = valid();
+        unknown["satisfiedByProductId"] = json!("9ZZZZZZZZZZZ");
+        assert!(classified(vec![(A, unknown), (plan, valid())]).is_empty());
+        for (field, value) in [
+            ("isTrial", json!(true)),
+            ("sharingSource", json!("Family")),
+            ("status", json!("Revoked")),
+            ("endDate", json!("2000-01-01T00:00:00Z")),
+            ("isPositron", json!("unknown")),
+        ] {
+            let mut row = valid();
+            row[field] = value;
+            assert!(classified(vec![(A, row)]).is_empty(), "{field}");
+        }
+        let mut child = valid();
+        child["satisfiedByProductId"] = json!(plan);
+        let mut expired_plan = valid();
+        expired_plan["endDate"] = json!("2000-01-01T00:00:00Z");
+        assert!(classified(vec![(A, child), (plan, expired_plan)]).is_empty());
+    }
+
+    #[test]
+    fn disc_derived_access_stays_owned_including_through_a_game_pass_parent() {
+        let mut disc = valid();
+        disc["isPositron"] = json!(true);
+        disc["satisfiedByProductId"] = json!("CFQ7TTC0KGQ8");
+        assert_eq!(labeled(&classified(vec![(A, disc)])), vec![(A.to_owned(), "owned".to_owned())]);
+        let mut legacy = valid();
+        legacy["isPositron"] = json!(1);
+        assert!(classified(vec![(A, legacy)]).is_empty());
+    }
+
     #[test]
     fn keeps_only_license_fields_no_account_tokens_or_renewal_details() {
         let row = json!({"status":"Active","isTrial":false,"sharingSource":"None","endDate":"2099-01-01T00:00:00Z","satisfiedByProductId":"CFQ7TTC0KGQ8","secret":"not-output"});
