@@ -6,8 +6,9 @@ rem   build all        also build target\release\xodus-cli.exe
 rem   build test       run the workspace tests (known failures: UPSTREAM.md)
 rem   build clean      remove target\
 rem
-rem Needs Rust 1.99.0 (MSVC), protoc and cmake on PATH, and Visual Studio
-rem Build Tools with the Windows SDK (cl.exe and rc.exe are found without PATH).
+rem Needs Rust 1.99.0 (MSVC), protoc and cmake on PATH, OpenSSL (OPENSSL_DIR), and
+rem Visual Studio Build Tools with the Windows SDK (cl.exe and rc.exe are found
+rem without PATH).
 
 setlocal
 cd /d "%~dp0"
@@ -22,6 +23,7 @@ if /i not "%MODE%"=="gui" if /i not "%MODE%"=="all" if /i not "%MODE%"=="test" g
 where cargo >nul 2>nul || (echo error: cargo not found. Install rustup and the 1.99.0 MSVC toolchain. & exit /b 1)
 where protoc >nul 2>nul || if not defined PROTOC (echo error: protoc not found. The xodus crate runs prost-build; put protoc on PATH or set PROTOC. & exit /b 1)
 where cmake >nul 2>nul || if not defined CMAKE (echo error: cmake not found. zlib-ng is built with CMake; put cmake on PATH or set CMAKE. & exit /b 1)
+if not defined OPENSSL_DIR if not defined OPENSSL_LIB_DIR if not defined VCPKG_ROOT (echo error: OpenSSL not found. openssl-sys needs it; install Win64 OpenSSL and set OPENSSL_DIR. & exit /b 1)
 
 for /f "tokens=2" %%v in ('rustc --version') do set "RUSTC_VERSION=%%v"
 if not "%RUSTC_VERSION%"=="1.99.0" echo warning: rustc %RUSTC_VERSION%; this project is built and tested with 1.99.0.

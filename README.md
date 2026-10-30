@@ -56,6 +56,7 @@ You need:
 - Rust 1.99.0 with the MSVC toolchain.
 - Visual Studio Build Tools (Desktop development with C++, including the Windows SDK).
 - `protoc` and `cmake` on `PATH`.
+- OpenSSL for Windows, for example the Win64 OpenSSL installer from Shining Light Productions, with `OPENSSL_DIR` set to its folder. For a single self-contained exe, also set `OPENSSL_LIB_DIR=%OPENSSL_DIR%\lib\VC\x64\MT`, `OPENSSL_LIBS=libssl_static:libcrypto_static` and `OPENSSL_STATIC=1`, as the release workflow does.
 
 ```bat
 build.cmd           :: target\release\gamepass-downloader.exe

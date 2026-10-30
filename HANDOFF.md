@@ -86,6 +86,8 @@ Patch behavior is documented in xodus-nexus `scripts/BACKEND.md`. The ordered pa
 
 OpenSSL is not a starting requirement. `reqwest` on Windows uses the system TLS stack. Add it only if a crate fails the build asking for it.
 
+Correction, 2026-10-31: OpenSSL is required. `openssl-sys` comes in through `eappx` → `xts-mode` (the `extract-eappx` command). This machine has Win64 OpenSSL 4.1 at `C:\Program Files\OpenSSL-Win64`, with `OPENSSL_DIR`, `OPENSSL_INCLUDE_DIR` and `OPENSSL_LIB_DIR` (`lib\VC\x64\MD`) set, which is why it never failed here. The first release run (a clean Windows runner) failed on it. The local exe imports no OpenSSL DLL even though it links the `MD` import libraries, because the linker drops the unused calls. The release workflow links the static `MT` libraries instead (`OPENSSL_LIBS=libssl_static:libcrypto_static`, `OPENSSL_STATIC=1`), so the exe stays self-contained either way, and it fails if an OpenSSL DLL shows up in the imports.
+
 ## First build
 
 Work in a copy of the Xodus tree. Apply every patch in `backend-source.lock.json` in order with `git apply`. Later patches depend on earlier ones. Do not hand-pick a subset until a patch fails because it is Linux-only.
