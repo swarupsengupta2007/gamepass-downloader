@@ -15,7 +15,6 @@ pub async fn run(
     tokens: &TokenManager,
     product: String,
     market: Option<String>,
-    dry_run: bool,
 ) -> ExitCode {
     let content_id_task = get_content_id(client, product, market).await;
     let Ok(content_id) = content_id_task else {
@@ -60,10 +59,6 @@ pub async fn run(
             file.cdn_root_paths.first().unwrap(),
             file.relative_url
         );
-        if dry_run {
-            println!("{}", url);
-            continue;
-        }
 
         let progress_bar = ProgressBar::new(file.file_size as u64).with_style(
             ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}) ({eta})").unwrap()
