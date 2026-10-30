@@ -1,3 +1,4 @@
 /target
 .env
 samples
+.claude/settings.local.json
