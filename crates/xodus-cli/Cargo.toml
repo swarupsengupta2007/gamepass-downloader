@@ -7,6 +7,7 @@ default-run = "xodus-cli"
 [dependencies]
 xodus = { path = "../xodus" }
 msixvc = { path = "../msixvc" }
+msixvc-common = { path = "../msixvc-common" }
 eappx = { git = "https://github.com/tuxuser/eappx-rs" }
 base64 = { workspace = true }
 tokio = { workspace = true }
@@ -29,6 +30,16 @@ tempfile = "3.27.0"
 rustix = "1.1.4"
 ctrlc = "3.5.2"
 nix = "0.31.3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Registry",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+] }
 
 [features]
 default = ["native-webview"]
