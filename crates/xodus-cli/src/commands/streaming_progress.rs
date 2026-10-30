@@ -3,6 +3,7 @@ use super::ProgressEvent;
 use std::{
     collections::HashMap,
     io::{BufRead, Write},
+    path::PathBuf,
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, watch};
@@ -155,16 +156,51 @@ impl State {
     }
 }
 
-pub(super) async fn report(mut events: mpsc::Receiver<ProgressEvent>) {
+/// Mirrors the latest record into the download folder, so a window that did
+/// not start this process can still show its status and speed.
+const STATUS_FILE: &str = ".xodus-streaming-progress.json";
+
+struct StatusFile {
+    path: PathBuf,
+    written: Option<Instant>,
+}
+
+impl StatusFile {
+    fn write(&mut self, record: &serde_json::Value, transition: bool) {
+        if !transition && self.written.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
+            return;
+        }
+        let mut record = record.clone();
+        record["updatedAt"] = serde_json::json!(chrono::Utc::now().timestamp_millis());
+        let temp = self.path.with_extension("tmp");
+        if std::fs::write(&temp, format!("{record}\n")).is_ok() {
+            std::fs::rename(&temp, &self.path).ok();
+        }
+        self.written = Some(Instant::now());
+    }
+}
+
+pub(super) async fn report(mut events: mpsc::Receiver<ProgressEvent>, root: PathBuf) {
     let mut state = State {
         phase: "initializing",
         ..Default::default()
     };
+    let mut status = StatusFile { path: root.join(STATUS_FILE), written: None };
     let mut sequence = 0;
     let mut last = Instant::now();
     let mut previous = 0;
-    emit(&state, sequence, 0);
-    while let Some(event) = events.recv().await {
+    emit(&state, sequence, 0, &mut status, true);
+    loop {
+        // Long quiet phases (resume verification) still refresh the status
+        // file, so readers can tell a busy process from a dead one.
+        let event = match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
+            Ok(Some(event)) => event,
+            Ok(None) => break,
+            Err(_) => {
+                status.write(&state.record(sequence, 0), false);
+                continue;
+            }
+        };
         let transition = state.apply(event);
         let elapsed = last.elapsed();
         if transition || elapsed >= Duration::from_millis(200) {
@@ -175,7 +211,7 @@ pub(super) async fn report(mut events: mpsc::Receiver<ProgressEvent>) {
                     as u64
             };
             sequence += 1;
-            emit(&state, sequence, rate);
+            emit(&state, sequence, rate, &mut status, transition);
             last = Instant::now();
             previous = state.completed;
         }
@@ -185,12 +221,14 @@ pub(super) async fn report(mut events: mpsc::Receiver<ProgressEvent>) {
     }
 }
 
-fn emit(state: &State, sequence: u64, rate: u64) {
+fn emit(state: &State, sequence: u64, rate: u64, status: &mut StatusFile, transition: bool) {
+    let record = state.record(sequence, rate);
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     // Explicit prefix isolates the protocol from any ordinary CLI log output.
-    writeln!(out, "NEXUS_PROGRESS {}", state.record(sequence, rate)).ok();
+    writeln!(out, "NEXUS_PROGRESS {record}").ok();
     out.flush().ok();
+    status.write(&record, transition);
 }
 
 #[cfg(test)]

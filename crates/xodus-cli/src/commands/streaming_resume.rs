@@ -12,6 +12,8 @@ pub(super) struct Journal {
     root: PathBuf,
     identity: String,
     entries: serde_json::Map<String, serde_json::Value>,
+    journal: Option<File>,
+    pending: u32,
 }
 
 /// Preserve completed ciphertext pages, trim only uncommitted data. Return the
@@ -245,6 +247,8 @@ impl Journal {
             root: root.to_owned(),
             identity,
             entries,
+            journal: None,
+            pending: 0,
         };
         journal.compact()?;
         Ok(journal)
@@ -267,19 +271,49 @@ impl Journal {
     }
 
     pub(super) fn checkpoint(&mut self, name: &str, offset: u64) -> io::Result<()> {
+        if self.entries.get(name).and_then(|entry| entry["offset"].as_u64()) == Some(offset) {
+            return Ok(());
+        }
+        // The tail hash is checked again on resume. Forcing every small file
+        // out to disk here serializes the download behind one flush per file.
         let file = target(&self.root, name)?;
-        // File data reaches storage before the journal claims it can be resumed.
-        File::open(&file)?.sync_data()?;
         let digest = tail(&file, offset)?;
         let entry = serde_json::json!({"offset": offset, "tailSha256": digest});
-        let path = target(&self.root, ".nexus-streaming-v1.jsonl")?;
-        let mut out = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        writeln!(out, "{}", self.record(name, &entry))?;
-        out.sync_all()?;
+        self.append(name, &entry)?;
         self.entries.insert(name.to_owned(), entry);
+        let large = offset >= 32 * 1024 * 1024;
+        if self.pending >= 64 || large {
+            self.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Make the current batch of checkpoints durable.
+    pub(super) fn commit(&mut self) -> io::Result<()> {
+        if self.pending == 0 {
+            return Ok(());
+        }
+        if let Some(file) = self.journal.as_mut() {
+            file.sync_all()?;
+        }
+        self.pending = 0;
+        Ok(())
+    }
+
+    fn append(&mut self, name: &str, entry: &serde_json::Value) -> io::Result<()> {
+        if self.journal.is_none() {
+            let path = target(&self.root, ".nexus-streaming-v1.jsonl")?;
+            self.journal = Some(
+                fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?,
+            );
+        }
+        let line = self.record(name, entry);
+        let out = self.journal.as_mut().expect("journal file");
+        writeln!(out, "{line}")?;
+        self.pending += 1;
         Ok(())
     }
 
@@ -296,18 +330,45 @@ impl Journal {
             let mut out = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(&temp)?;
+                .open(&temp)
+                .map_err(|error| io::Error::new(error.kind(), format!("checkpoint create: {error}")))?;
             for (name, entry) in &self.entries {
                 writeln!(out, "{}", self.record(name, entry))?;
             }
-            out.sync_all()?;
-            fs::rename(&temp, &path)?;
-            File::open(&self.root)?.sync_all()
+            out.sync_all()
+                .map_err(|error| io::Error::new(error.kind(), format!("checkpoint flush: {error}")))?;
+            fs::rename(&temp, &path)
+                .map_err(|error| io::Error::new(error.kind(), format!("checkpoint replace: {error}")))?;
+            sync_directory(&self.root)
+                .map_err(|error| io::Error::new(error.kind(), format!("checkpoint directory: {error}")))
         })();
         if result.is_err() {
             fs::remove_file(&temp).ok();
         }
         result
+    }
+}
+
+fn sync_directory(root: &Path) -> io::Result<()> {
+    // Opening a directory for a normal flush is denied on Windows. The
+    // checkpoint file itself is already flushed before the rename.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        return match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(root)
+            .and_then(|file| file.sync_all())
+        {
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(()),
+            other => other,
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(root)?.sync_all()
     }
 }
 

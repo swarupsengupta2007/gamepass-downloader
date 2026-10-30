@@ -5,6 +5,7 @@ use std::io::{self, Error, ErrorKind, Read, Seek, SeekFrom, Write};
 
 use aes::cipher::KeyInit;
 use aes::{Aes128Dec, Aes128Enc};
+use sha2::Digest;
 use msixvc_common::parse::{BinaryParse, BinaryTryParse};
 use tokio::fs::OpenOptions;
 use tokio::io::{
@@ -329,9 +330,64 @@ impl SegmentFile {
     }
 }
 
+/// Checks files on disk against the package hash tree, which holds SHA-256
+/// (first 20 bytes) of every encrypted page. Plain pages are encrypted again
+/// with the content key to compare.
+pub struct PageCheck<'a> {
+    xvd: &'a XvdFile,
+    tweak_cipher: Aes128Enc,
+    data_cipher: Aes128Enc,
+}
+
+impl PageCheck<'_> {
+    /// Whether the `index`th page of `file` as stored on disk matches the
+    /// package: ciphertext for files kept encrypted, otherwise plain bytes
+    /// zero-filled past the end of the file. `None` when the package has no
+    /// hash for that page.
+    pub fn matches(&self, file: &SegmentFile, index: u64, page: &[u8; PAGE_SIZE]) -> Option<bool> {
+        let offset = file.offset.checked_add(index.checked_mul(PAGE_SIZE as u64)?)?;
+        let section = self.xvd.encrypted_section_infos.iter().find(|s| {
+            offset >= s.section_offset && offset < s.section_offset + s.section_length
+        })?;
+        let in_section = ((offset - section.section_offset) / PAGE_SIZE as u64) as usize;
+        let expected = section.data_hashs.get(in_section)?;
+        let actual = if file.keep_encrypted {
+            sha2::Sha256::digest(page)
+        } else {
+            let unit = match &section.data_units {
+                Some(units) => *units.get(in_section)?,
+                None => in_section as u32,
+            };
+            let mut encrypted = *page;
+            let tweak = TweakGenerator::new(section.header_id, section.vduid).with_data_unit(unit);
+            crate::crypt::encrypt_page_xts(&mut encrypted, tweak, &self.tweak_cipher, &self.data_cipher);
+            sha2::Sha256::digest(encrypted)
+        };
+        Some(actual[..20] == expected[..])
+    }
+}
+
 impl XvdFile {
+    pub fn page_check(&self, full_key: [u8; 32]) -> PageCheck<'_> {
+        let tweak_key: [u8; 16] = full_key[..16].try_into().unwrap();
+        let data_key: [u8; 16] = full_key[16..].try_into().unwrap();
+        PageCheck {
+            xvd: self,
+            tweak_cipher: Aes128Enc::new((&tweak_key).into()),
+            data_cipher: Aes128Enc::new((&data_key).into()),
+        }
+    }
+
     pub fn content_id(&self) -> uuid::Uuid {
         self.header.vduid
+    }
+
+    pub fn header(&self) -> &XvdHeader {
+        &self.header
+    }
+
+    pub fn layout(&self) -> &XvdLayout {
+        &self.layout
     }
 
     pub fn resume_identity(&self) -> String {
@@ -874,6 +930,11 @@ impl XvdFile {
         }
         let page_start = file_offset_in_section / PAGE_SIZE as u64;
         let page_count = sfile.length.div_ceil(PAGE_SIZE as u64);
+        // The hash tree holds SHA-256 (first 20 bytes) of every encrypted page
+        // as served. Pages are checked before use, so bytes damaged on the way
+        // are fetched again instead of being written into the game.
+        let hashes = s.map(|s| (&s.data_hashs[..], (sfile.offset - s.section_offset) / PAGE_SIZE as u64));
+        let (mut integrity_retries, mut integrity_failed_at) = (0, None);
 
         let mut page = [0u8; PAGE_SIZE];
         if resume_offset > sfile.length || resume_offset % PAGE_SIZE as u64 != 0 {
@@ -884,11 +945,12 @@ impl XvdFile {
         let page_length = sfile.length.div_ceil(PAGE_SIZE as u64) * PAGE_SIZE as u64;
         let mut pending = bytes::BytesMut::new();
         let mut v: u64 = resume_offset;
+        let mut reported = resume_offset;
         let mut last_checkpoint = resume_offset;
         let start = sfile.offset.checked_add(v).ok_or(TransferError::new("transfer-range", 0))?;
         let end = sfile.offset.checked_add(page_length - 1).ok_or(TransferError::new("transfer-range", 0))?;
         let mut transfer = RangeReader::new(client, url, start, end, Policy::default());
-        loop {
+        'transfer: loop {
             if page_in_section >= page_start + page_count || remaining == 0 {
                 break;
             }
@@ -932,7 +994,10 @@ impl XvdFile {
                 )));
             }
             v += data.len() as u64;
-            progress(min(v, sfile.length), sfile.length);
+            if v > reported {
+                reported = v;
+                progress(min(v, sfile.length), sfile.length);
+            }
 
             pending.extend_from_slice(&data);
 
@@ -942,6 +1007,25 @@ impl XvdFile {
                 }
                 let chunk = pending.split_to(4096);
                 page.copy_from_slice(&chunk);
+                let done = sfile.length - remaining;
+                let expected = hashes.and_then(|(hashes, first)| hashes.get((first + done / PAGE_SIZE as u64) as usize));
+                if expected.is_some_and(|expected| sha2::Sha256::digest(page)[..20] != expected[..]) {
+                    integrity_retries = if integrity_failed_at == Some(done) { integrity_retries + 1 } else { 1 };
+                    integrity_failed_at = Some(done);
+                    if integrity_retries > 4 {
+                        out.flush().await?;
+                        checkpoint(done)?;
+                        return Err(Box::new(TransferError::new("transfer-integrity", 0)));
+                    }
+                    // Fetch again from this page, which failed and everything
+                    // before it passed, from the next CDN location.
+                    eprintln!("{}", TransferError::new("transfer-integrity-retry", 0).diagnostic());
+                    pending.clear();
+                    v = done;
+                    let source = crate::streaming_http::mirror(url, integrity_retries);
+                    transfer = RangeReader::new(client, &source, sfile.offset + done, end, Policy::default());
+                    continue 'transfer;
+                }
                 let to_write_remaining = remaining.min(PAGE_SIZE as u64) as usize;
                 let to_write = if let Some(tweak) = &tweak {
                     let tweak = tweak.with_data_unit(match &s.unwrap().data_units {

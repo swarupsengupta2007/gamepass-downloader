@@ -23,6 +23,10 @@ mod progress;
 mod resume;
 #[path = "streaming_failure.rs"]
 mod failure;
+#[path = "streaming_split.rs"]
+mod split;
+#[path = "streaming_batch.rs"]
+mod batch;
 
 #[cfg(test)]
 #[path = "streaming_preflight_tests.rs"]
@@ -31,6 +35,21 @@ mod preflight_tests;
 struct Job {
     name: String,
     content: SegmentFile,
+}
+
+enum Work {
+    File(Job),
+    /// Small neighbouring files fetched with one request (`batch`).
+    Batch(Vec<(String, SegmentFile)>),
+}
+
+impl Work {
+    fn size(&self) -> u64 {
+        match self {
+            Work::File(job) => job.content.length,
+            Work::Batch(files) => files.iter().map(|(_, f)| f.length).sum(),
+        }
+    }
 }
 
 fn pending_files<'a>(
@@ -58,6 +77,88 @@ fn pending_files<'a>(
         if !unchanged || needs_repair { pending.push((name, file)); }
     }
     Ok(pending)
+}
+
+/// The package's content key from the account's license. A missing
+/// entitlement is an error.
+pub(crate) async fn content_key(
+    client: &reqwest::Client,
+    tokens: &TokenManager,
+    content_id: String,
+    market: Option<String>,
+) -> Result<[u8; 32], String> {
+    let (key, license) = get_license(client, tokens, content_id, market.unwrap_or("neutral".to_string()))
+        .await
+        .map_err(|error| error.to_string())?;
+    if license.content_keys.len() != 1 {
+        return Err(format!("unexpected number of content keys {}", license.content_keys.len()));
+    }
+    let (_, content_key) = license.content_keys.into_iter().next().expect("one key");
+    content_key
+        .unpack(&key)
+        .map(|key| *key)
+        .map_err(|_| "The content key could not be authenticated. Retry the installation or sign in again.".to_owned())
+}
+
+/// Every CDN location of the package, fastest first, with the order also
+/// given to `msixvc` for refetching damaged pages.
+pub(crate) async fn package_urls(client: &reqwest::Client, tokens: &TokenManager, content_id: String) -> Result<Vec<String>, String> {
+    let package = get_packages(client, tokens, content_id).await.map_err(|error| error.to_string())?;
+    let file = package.package_files.iter().find(|p| p.file_name.ends_with(".msixvc")).ok_or("No .msixvc file found")?;
+    let urls: Vec<String> = ranked_roots(client, file).await.into_iter().map(|root| format!("{root}{}", file.relative_url)).collect();
+    if urls.is_empty() {
+        return Err("Microsoft returned no package download location.".to_owned());
+    }
+    msixvc::streaming_http::set_mirrors(urls.clone());
+    Ok(urls)
+}
+
+/// Rank the CDN roots by how fast they serve this package right now. Edges
+/// differ a lot: one can sit near 0 B/s while another runs at full line rate,
+/// which is also why the Xbox app's own download stalls. Probes a 4 MiB range
+/// from the middle of the package on every root, foreground and background, for
+/// at most a few seconds each. Roots are reported by index only.
+async fn ranked_roots(client: &reqwest::Client, file: &xodus::models::packagespc::PackageFile) -> Vec<String> {
+    const PROBE: u64 = 4 * 1024 * 1024;
+    let roots: Vec<&String> = file.cdn_root_paths.iter().chain(&file.background_cdn_root_paths).collect();
+    if roots.len() < 2 {
+        return roots.into_iter().cloned().collect();
+    }
+    let size = u64::try_from(file.file_size).unwrap_or(0);
+    let start = (size / 2) & !0xFFF;
+    let end = (start + PROBE).min(size.max(1)) - 1;
+    let mut ranked: Vec<(f64, &String)> = Vec::new();
+    for (index, root) in roots.iter().enumerate() {
+        let begun = std::time::Instant::now();
+        let mut received = 0u64;
+        let probe = async {
+            let mut response = client
+                .get(format!("{root}{}", file.relative_url))
+                .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
+                .send()
+                .await
+                .ok()?
+                .error_for_status()
+                .ok()?;
+            while let Ok(Some(chunk)) = response.chunk().await {
+                received += chunk.len() as u64;
+                if received >= PROBE {
+                    break;
+                }
+            }
+            Some(())
+        };
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(6), probe).await;
+        let rate = received as f64 / begun.elapsed().as_secs_f64().max(0.001);
+        eprintln!(
+            "CDN root {index}: {:.1} MB/s{}",
+            rate / 1_048_576.0,
+            if matches!(finished, Ok(Some(()))) { "" } else { " (incomplete)" }
+        );
+        ranked.push((rate, root));
+    }
+    ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+    ranked.into_iter().map(|(_, root)| root.clone()).collect()
 }
 
 enum ProgressEvent {
@@ -143,31 +244,10 @@ pub async fn run(
             } else {
                 source
             };
-            let package_result = get_packages(client, tokens, content_id.clone()).await;
-            let Ok(package) = package_result else {
-                let Err(err) = package_result else {
-                    eprintln!("Unknown Error");
-                    return ExitCode::FAILURE;
-                };
-                eprintln!("{}", err);
-                return ExitCode::FAILURE;
-            };
-            let Some(file) = package
-                .package_files
-                .iter()
-                .find(|p| p.file_name.ends_with(".msixvc"))
-            else {
-                eprintln!("No .msixvc file found");
-                return ExitCode::FAILURE;
-            };
-            let Some(root) = file.cdn_root_paths.first() else {
-                eprintln!("Microsoft returned no package download location."); return ExitCode::FAILURE;
-            };
-            format!(
-                "{}{}",
-                root,
-                file.relative_url
-            )
+            match package_urls(client, tokens, content_id).await {
+                Ok(urls) => urls[0].clone(),
+                Err(error) => { eprintln!("{error}"); return ExitCode::FAILURE; }
+            }
         };
         let url = &vurl;
         let mut pos = 0;
@@ -229,9 +309,10 @@ async fn run_cli_reader<Reader>(
 where
     Reader: AsyncRead + Unpin,
 {
+    let status_root = std::path::PathBuf::from(&destination);
     let reporter = tokio::spawn(async move {
         if progress_json {
-            progress::report(rx).await;
+            progress::report(rx, status_root).await;
             return;
         }
         let multi_progress = MultiProgress::new();
@@ -278,10 +359,13 @@ where
 
         total_progess.abandon();
     });
+    // A partial or resumed folder must never look finished to `adopt`.
+    let marker = std::path::Path::new(&destination).join(crate::xbox::COMPLETE_MARKER);
+    std::fs::remove_file(&marker).ok();
     let code = run_reader(
         client,
         tokens,
-        destination,
+        destination.clone(),
         try_skip_ntfs,
         parallel,
         market,
@@ -292,6 +376,17 @@ where
         pause,
     )
     .await;
+    let code = if code == ExitCode::SUCCESS && !try_skip_ntfs {
+        match crate::xbox::write_complete_marker(std::path::Path::new(&destination)) {
+            Ok(()) => code,
+            Err(error) => {
+                eprintln!("could not record the finished download: {error}");
+                ExitCode::FAILURE
+            }
+        }
+    } else {
+        code
+    };
     tx.send(ProgressEvent::Completed {
         success: code == ExitCode::SUCCESS,
     })
@@ -420,38 +515,17 @@ where
         }
     }
 
-    let license = get_license(
-        client,
-        tokens,
-        remote_xvd.content_id().to_string(),
-        market.unwrap_or("neutral".to_string()),
-    )
-    .await;
-    if let Err(err) = license {
-        eprintln!("{}", err);
-        return ExitCode::FAILURE;
-    }
-    let (key, game_splicense) = license.unwrap();
-    if game_splicense.content_keys.len() != 1 {
-        eprintln!(
-            "unexpected number of content keys {}",
-            game_splicense.content_keys.len()
-        );
-        return ExitCode::FAILURE;
-    }
-    let Some((_, content_key)) = game_splicense.content_keys.into_iter().next() else {
-        return ExitCode::FAILURE;
-    };
-
-    let full_key = match content_key.unpack(&key) {
+    let full_key = match content_key(client, tokens, remote_xvd.content_id().to_string(), market).await {
         Ok(key) => key,
-        Err(_) => { eprintln!("The content key could not be authenticated. Retry the installation or sign in again."); return ExitCode::FAILURE; }
+        Err(error) => { eprintln!("{error}"); return ExitCode::FAILURE; }
     };
+    let full_key = &full_key;
 
-    let pending = match pending_files(out, &rfiles, &lfiles) {
+    let mut pending = match pending_files(out, &rfiles, &lfiles) {
         Ok(files) => files,
         Err(error) => { eprintln!("Unable to inspect installed package files: {error}"); return ExitCode::FAILURE; }
     };
+    pending.sort_by(|a, b| b.1.length.cmp(&a.1.length).then_with(|| a.0.cmp(b.0)));
     let total_size: u64 = pending
         .iter()
         .map(|(_, v)| v.length)
@@ -499,23 +573,33 @@ where
     .await
     .ok();
 
+    // Small files not yet downloaded go in runs of neighbours, one request
+    // each (`batch`); a file left alone in its run downloads as usual.
+    let owned = |n: &String, v: &SegmentFile| {
+        (n.clone(), SegmentFile { offset: v.offset, length: v.length, data_hashs: vec![], keep_encrypted: v.keep_encrypted })
+    };
+    let (small, single): (Vec<_>, Vec<_>) = pending.into_iter().partition(|(name, file)| {
+        !url.starts_with("file://") && batch::fits(file) && journal.lock().unwrap().offset(name, file.length) != file.length
+    });
+    let mut work: Vec<Work> = single.into_iter().map(|(n, v)| owned(n, v)).map(|(name, content)| Work::File(Job { name, content })).collect();
+    for mut run in batch::runs(small.into_iter().map(|(n, v)| owned(n, v)).collect()) {
+        work.push(match run.len() {
+            1 => {
+                let (name, content) = run.remove(0);
+                Work::File(Job { name, content })
+            }
+            _ => Work::Batch(run),
+        });
+    }
+    // Starting the largest first leaves small work for the end, so all
+    // parallel streams stay busy until the tail. Large files also download in
+    // several parts at once (`split`), so the last big file is not one stream.
+    work.sort_by_key(|w| std::cmp::Reverse(w.size()));
+
     let remote_xvd_ref = &remote_xvd;
     let (failed, failure_signal) = tokio::sync::watch::channel(false);
-    stream::iter(
-        pending
-            .into_iter()
-            .map(|(n, v)| Job {
-                name: n.clone(),
-                content: SegmentFile {
-                    offset: v.offset,
-                    length: v.length,
-                    data_hashs: vec![],
-                    keep_encrypted: v.keep_encrypted,
-                },
-            })
-            .enumerate(),
-    )
-    .for_each_concurrent(parallel.unwrap_or(4).max(1), |(id, job)| {
+    stream::iter(work.into_iter().enumerate())
+    .for_each_concurrent(parallel.unwrap_or(4).max(1), |(id, work)| {
         let tx = tx.clone();
         let client = client.clone();
         let mut pause = pause.clone();
@@ -529,6 +613,34 @@ where
                 Ok(())
             };
             if failure::run_or_cancel(failure_signal.clone(), prepared).await.is_err() { return; }
+            let job = match work {
+                Work::File(job) => job,
+                Work::Batch(files) => {
+                    let total = files.iter().map(|(_, f)| f.length).sum();
+                    tx.send(ProgressEvent::Started { id, name: format!("{} small files", files.len()), total }).await.ok();
+                    let mut lp = 0;
+                    let operation = batch::download(
+                        remote_xvd_ref,
+                        &client,
+                        url,
+                        out,
+                        &files,
+                        *full_key,
+                        pause,
+                        |pos| {
+                            if tx.try_send(ProgressEvent::Advanced { id, delta: pos - lp }).is_ok() {
+                                lp = pos;
+                            }
+                        },
+                        |name, length| journal.lock().unwrap().checkpoint(name, length),
+                    );
+                    match failure::run_or_cancel(failure_signal, operation).await {
+                        Ok(()) => { tx.send(ProgressEvent::Finished { id }).await.ok(); }
+                        Err(error) => { if !failed.send_replace(true) { failure::report(error.as_ref()); } }
+                    }
+                    return;
+                }
+            };
             let opened = async {
                 let target_file = resume::target(out, &job.name)?;
                 if let Some(folder) = target_file.parent() { std::fs::create_dir_all(folder)?; }
@@ -581,16 +693,30 @@ where
             if offset == job.content.length {
                 return Ok::<(),failure::Error>(());
             }
-            journal
-                .lock()
-                .unwrap()
-                .checkpoint(&job.name, offset)?;
+            if offset != 0 {
+                journal.lock().unwrap().checkpoint(&job.name, offset)?;
+            }
 
             if let Some(fpath) = url.strip_prefix("file://") {
                 let mut i = File::open(&fpath).await?;
                 remote_xvd_ref
                     .extract_file(&mut i, &mut fout, &job.content, *full_key, progress)
                     .await?;
+            } else if !job.content.keep_encrypted && job.content.length - offset >= split::SPLIT_FROM {
+                let target = resume::target(out, &job.name)?;
+                split::download(
+                    remote_xvd_ref,
+                    &client,
+                    url,
+                    &target,
+                    &job.content,
+                    *full_key,
+                    offset,
+                    pause,
+                    progress,
+                    |position| journal.lock().unwrap().checkpoint(&job.name, position),
+                )
+                .await?;
             } else {
                 remote_xvd_ref
                     .download_file_http(
@@ -618,6 +744,10 @@ where
     })
     .await;
 
+    if let Err(error) = journal.lock().unwrap().commit() {
+        eprintln!("Unable to save download checkpoints: {error}");
+        return ExitCode::FAILURE;
+    }
     if *failed.borrow() { return ExitCode::FAILURE; }
     tx.send(ProgressEvent::UpdateStatus {
         name: "Finalizing".to_owned(),

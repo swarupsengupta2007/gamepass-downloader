@@ -46,9 +46,12 @@ fn streaming_repair_selection_rejects_nonfile_and_symlinked_encrypted_paths() {
     std::fs::create_dir(root.path().join("Game.exe")).unwrap();
     assert!(pending_files(root.path(),&make(),&make()).is_err());
     std::fs::remove_dir(root.path().join("Game.exe")).unwrap();
-    let outside=tempfile::NamedTempFile::new().unwrap();
-    std::os::unix::fs::symlink(outside.path(),root.path().join("Game.exe")).unwrap();
-    assert!(pending_files(root.path(),&make(),&make()).is_err());
+    #[cfg(unix)]
+    {
+        let outside=tempfile::NamedTempFile::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(),root.path().join("Game.exe")).unwrap();
+        assert!(pending_files(root.path(),&make(),&make()).is_err());
+    }
 }
 
 #[tokio::test]

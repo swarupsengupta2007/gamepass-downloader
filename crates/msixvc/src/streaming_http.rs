@@ -40,6 +40,24 @@ impl std::fmt::Display for TransferError {
 }
 impl std::error::Error for TransferError {}
 
+static MIRRORS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// Every CDN location of the package, best first. A page that fails its hash
+/// is fetched from the next one, because an edge can keep serving the same
+/// damaged bytes for a range.
+pub fn set_mirrors(urls: Vec<String>) {
+    *MIRRORS.write().unwrap() = urls;
+}
+
+/// The location to use for the `attempt`th refetch of a range from `url`.
+pub(crate) fn mirror(url: &str, attempt: usize) -> String {
+    let mirrors = MIRRORS.read().unwrap();
+    match mirrors.iter().position(|m| m == url) {
+        Some(i) => mirrors[(i + attempt) % mirrors.len()].clone(),
+        None => url.to_owned(),
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct Policy {
     pub timeout: Duration,

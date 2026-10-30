@@ -82,6 +82,80 @@ async fn streaming_encrypted_download_and_partial_resume_keep_exact_ciphertext_f
     }
 }
 
+/// Serves `body` to each Range request, damaging page 1 of the first
+/// `damaged` responses. Returns the requested start offsets.
+async fn damaging_server(body: Vec<u8>, damaged: usize) -> (String, tokio::task::JoinHandle<Vec<usize>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut starts = vec![];
+        while let Ok(Ok((mut socket, _))) = tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await {
+            let mut request = vec![];
+            while !request.ends_with(b"\r\n\r\n") { request.push(socket.read_u8().await.unwrap()); }
+            let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+            let start: usize = request.split("range: bytes=").nth(1).unwrap().split('-').next().unwrap().parse().unwrap();
+            let mut served = body[start..].to_vec();
+            if starts.len() < damaged && start <= PAGE_SIZE + 3000 {
+                served[PAGE_SIZE + 3000 - start] ^= 0xFF;
+            }
+            starts.push(start);
+            socket.write_all(format!("HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{}/{}\r\nConnection: close\r\n\r\n", served.len(), body.len() - 1, body.len()).as_bytes()).await.unwrap();
+            socket.write_all(&served).await.ok();
+        }
+        starts
+    });
+    (format!("http://{address}/synthetic"), server)
+}
+
+#[tokio::test]
+async fn streaming_damaged_page_is_fetched_again_and_never_written() {
+    let (mut xvd, mut content, key, plain, ciphertext) = fixture(3 * 4096 + 5);
+    xvd.encrypted_section_infos[0].data_hashs = ciphertext.chunks(PAGE_SIZE).map(|p| sha2::Sha256::digest(p)[..20].try_into().unwrap()).collect();
+    content.keep_encrypted = false;
+    let (url, server) = damaging_server(ciphertext.clone(), 1).await;
+    let (mut downloaded, mut progress) = (vec![], vec![]);
+    xvd.download_file_http(&reqwest::Client::new(), &url, &mut downloaded, &content, key, |p, _| progress.push(p), None, 0, |_| Ok(())).await.unwrap();
+    assert_eq!(downloaded, plain);
+    assert_eq!(server.await.unwrap(), [0, PAGE_SIZE], "refetched from the damaged page");
+    assert!(progress.windows(2).all(|w| w[0] < w[1]), "progress never goes back");
+
+    let (url, server) = damaging_server(ciphertext, usize::MAX).await;
+    let (mut downloaded, mut committed) = (vec![], vec![]);
+    let error = xvd.download_file_http(&reqwest::Client::new(), &url, &mut downloaded, &content, key, |_, _| {}, None, 0, |n| { committed.push(n); Ok(()) }).await.unwrap_err();
+    assert_eq!(error.downcast_ref::<TransferError>(), Some(&TransferError::new("transfer-integrity", 0)));
+    assert_eq!(downloaded, plain[..PAGE_SIZE], "only the checked page was written");
+    assert_eq!(committed, [PAGE_SIZE as u64]);
+    assert_eq!(server.await.unwrap().len(), 5);
+}
+
+#[test]
+fn page_check_matches_plain_and_kept_encrypted_pages_and_catches_damage() {
+    let (mut xvd, mut content, key, plain, ciphertext) = fixture(2 * 4096 + 5);
+    xvd.encrypted_section_infos[0].data_hashs = ciphertext.chunks(PAGE_SIZE).map(|p| sha2::Sha256::digest(p)[..20].try_into().unwrap()).collect();
+    let check = xvd.page_check(key);
+    let page = |bytes: &[u8], i: usize| -> [u8; PAGE_SIZE] {
+        let mut page = [0; PAGE_SIZE];
+        let part = &bytes[i * PAGE_SIZE..bytes.len().min((i + 1) * PAGE_SIZE)];
+        page[..part.len()].copy_from_slice(part);
+        page
+    };
+    for i in 0..3 {
+        assert_eq!(check.matches(&content, i, &page(&ciphertext, i as usize)), Some(true), "ciphertext page {i}");
+    }
+    assert_eq!(check.matches(&content, 3, &[0; PAGE_SIZE]), None, "past the hashed pages");
+    content.keep_encrypted = false;
+    // The fixture's plain bytes past the file end are not zero, so the last
+    // page only matches with them.
+    let full_plain: Vec<u8> = (0..3 * PAGE_SIZE).map(|i| (i % 251) as u8).collect();
+    assert_eq!(&full_plain[..plain.len()], &plain[..]);
+    for i in 0..3 {
+        assert_eq!(check.matches(&content, i, &page(&full_plain, i as usize)), Some(true), "plain page {i}");
+    }
+    let mut damaged = page(&full_plain, 1);
+    damaged[3296] ^= 1;
+    assert_eq!(check.matches(&content, 1, &damaged), Some(false));
+}
+
 #[tokio::test]
 async fn streaming_plain_output_remains_unpadded_and_short_ciphertext_returns_error() {
     let (xvd, mut content, key, plain, ciphertext) = fixture(5000);
