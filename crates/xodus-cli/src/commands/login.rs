@@ -29,6 +29,10 @@ pub async fn run(client: &reqwest::Client, tokens: &TokenManager) -> ExitCode {
         Err(error) => {
             if let Some(error) = error.downcast_ref::<xodus::tokens::store::TokenStoreError>() {
                 error.report();
+            } else if let Some(stage) = xodus::api::live::exchange_failure_stage(error.as_ref()) {
+                eprintln!("Sign-in did not complete ({stage}).");
+            } else if error.downcast_ref::<std::io::Error>().is_some() {
+                eprintln!("Sign-in did not complete: {error}");
             } else {
                 eprintln!("Sign-in did not complete.");
             }
@@ -75,6 +79,7 @@ pub async fn run(client: &reqwest::Client, tokens: &TokenManager) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    eprintln!("Signed in.");
     ExitCode::SUCCESS
 }
 
@@ -171,6 +176,7 @@ impl webview::SessionHandler for LoginHandler {
                 if let Some(pp) = pp
                     && let Some(auth_url) = pp.inline_auth_url
                 {
+                    eprintln!("sign-in: another confirmation page is required");
                     runtime.close_session(session_id);
                     self.finish = true;
                     runtime.open_session(webview::finalize_request(auth_url));
@@ -182,6 +188,7 @@ impl webview::SessionHandler for LoginHandler {
                 Ok(webview::HandlerControl::Complete(None))
             }
             ExchangeUserTokenOutcome::Issued(da) => {
+                eprintln!("sign-in: account accepted");
                 runtime.close_session(session_id);
                 let user = secrets::User {
                     puid: data.puid,

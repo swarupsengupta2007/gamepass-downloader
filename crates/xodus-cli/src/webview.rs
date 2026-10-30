@@ -11,6 +11,10 @@ use xodus::models::live::{DAProperty, HostBridgeMessage};
 #[path = "webview_host_tests.rs"]
 mod hosted_signin_tests;
 
+#[cfg(windows)]
+#[path = "browser_auth.rs"]
+mod browser;
+
 type HandlerResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -162,6 +166,23 @@ pub fn finalize_request(url: String) -> WebviewRequest {
 }
 
 pub fn run_sessions<T>(handler: T) -> HandlerResult<Option<T::Output>>
+where
+    T: SessionHandler,
+{
+    // WebView2 is an embedded browser. Microsoft login hides passkey and
+    // authenticator sign-in there, so Windows uses Edge or Chrome instead.
+    #[cfg(windows)]
+    {
+        return browser::run(handler);
+    }
+    #[cfg(not(windows))]
+    {
+        run_embedded_sessions(handler)
+    }
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+fn run_embedded_sessions<T>(handler: T) -> HandlerResult<Option<T::Output>>
 where
     T: SessionHandler,
 {

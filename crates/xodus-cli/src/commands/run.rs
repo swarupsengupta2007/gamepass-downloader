@@ -32,7 +32,8 @@ async fn playfab_auth_header(client: &reqwest::Client, tokens: &TokenManager) ->
         return None;
     };
 
-    let xsts = xodus::api::xbox::run(client, dev_token, user_token, PLAYFAB_RELYING_PARTY).await.ok()?;
+    let username = tokens.get_user().ok()?.username;
+    let xsts = xodus::api::xbox::run(client, dev_token, user_token, &username, PLAYFAB_RELYING_PARTY).await.ok()?;
     xodus::api::xbox::get_xsts_auth_header(xsts).ok()
 }
 

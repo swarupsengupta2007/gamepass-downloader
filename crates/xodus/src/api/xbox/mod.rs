@@ -23,6 +23,7 @@ pub async fn run(
     client: &reqwest::Client,
     dev_token: LegacyToken,
     legacy: LegacyToken,
+    username: &str,
     relying_party: &str,
 ) -> Result<XstsResponse, SessionError> {
     use crate::models::secrets::InvalidTokenResponse;
@@ -30,7 +31,7 @@ pub async fn run(
         let user_token = crate::api::live::exchange_user_token(
             client,
             legacy,
-            "USERNAME".to_string(),
+            username.to_string(),
             dev_token,
             None,
             Some("Silent".to_string()),
@@ -44,7 +45,22 @@ pub async fn run(
         .map_err(|_| SessionError::Request)?;
 
         let user_token: Token = match user_token {
-            ExchangeUserTokenOutcome::Fault(_) => return Err(SessionError::Refused),
+            ExchangeUserTokenOutcome::Fault(pp) => {
+                let status = pp.as_ref().and_then(|pp| pp.req_status.as_deref()).unwrap_or("");
+                let code = status
+                    .strip_prefix("0x")
+                    .or_else(|| status.strip_prefix("0X"))
+                    .unwrap_or(status);
+                if code.len() == 8 && code.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    let stage = if pp.as_ref().and_then(|pp| pp.inline_auth_url.as_deref()).is_some_and(|url| !url.is_empty()) {
+                        "ticket-interaction-required"
+                    } else {
+                        "ticket-refused"
+                    };
+                    eprintln!("NEXUS_TICKET_DIAGNOSTIC_V1 {stage} {}", code.to_ascii_uppercase());
+                }
+                return Err(SessionError::Refused);
+            }
             ExchangeUserTokenOutcome::Issued(
                 soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection),
             ) => {
