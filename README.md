@@ -22,6 +22,8 @@ This has been run end to end on Ori and the Will of the Wisps, NINJA GAIDEN 4, R
 - A Microsoft account that owns the game, or has a Game Pass plan that includes it. Microsoft Store device limits still apply.
 - Microsoft Edge or Google Chrome for sign-in.
 
+Download `gamepass-downloader.exe` from [Releases](https://github.com/swarupsengupta2007/gamepass-downloader/releases). It is a single file with nothing to install, and `SHA256SUMS.txt` beside it has its checksum.
+
 Only Windows desktop games that install through the Xbox app into an Xbox library folder (`MSIXVC` packages) are supported. Older UWP titles that install under `WindowsApps` are not.
 
 ## Using the window
@@ -62,6 +64,8 @@ build.cmd test      :: workspace tests
 ```
 
 The exe links the C runtime statically and needs no other files beside it.
+
+Releases are built by `.github/workflows/release.yml`. Set `version` in `crates/gamepass-gui/Cargo.toml`, then push a matching tag (`git tag -a v0.1.0 -m "gamepass-downloader 0.1.0"`, `git push origin v0.1.0`). The workflow builds on a Windows runner and checks the exe imports only Windows system DLLs. It then publishes the exe and its checksum as a GitHub release. A tag with a suffix, such as `v0.2.0-rc1`, becomes a pre-release.
 
 `AGENTS.md` describes the design and the Xbox app internals the hand-off relies on. `HANDOFF.md` is the development log. `UPSTREAM.md` explains how to take in new upstream Xodus and Nexus releases.
 

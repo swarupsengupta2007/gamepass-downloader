@@ -1,0 +1,73 @@
+# Builds gamepass-downloader.exe for a version tag and publishes it as a GitHub release.
+# Cut a release by bumping `version` in crates/gamepass-gui/Cargo.toml, then:
+#   git tag -a v0.1.0 -m "gamepass-downloader 0.1.0"; git push origin v0.1.0
+
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      RUST_VERSION: 1.99.0
+      PROTOC_VERSION: '29.3'
+      CARGO_TERM_COLOR: always
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches the crate version
+        run: |
+          $version = (Select-String -Path crates/gamepass-gui/Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ("v$version" -ne $env:GITHUB_REF_NAME) {
+            throw "tag $env:GITHUB_REF_NAME does not match crates/gamepass-gui version $version"
+          }
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        run: |
+          rustup toolchain install $env:RUST_VERSION --profile minimal --target x86_64-pc-windows-msvc
+          rustup default $env:RUST_VERSION
+          rustc --version
+
+      - name: Install protoc ${{ env.PROTOC_VERSION }}
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP protoc
+          $zip = "$dir.zip"
+          Invoke-WebRequest "https://github.com/protocolbuffers/protobuf/releases/download/v$env:PROTOC_VERSION/protoc-$env:PROTOC_VERSION-win64.zip" -OutFile $zip
+          Expand-Archive $zip -DestinationPath $dir
+          "$dir\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Build
+        shell: cmd
+        run: build.cmd
+
+      - name: Check the exe imports only Windows system DLLs
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          $deps = & $dumpbin.FullName /dependents target\release\gamepass-downloader.exe | Out-String
+          $deps
+          if ($deps -match 'VCRUNTIME|MSVCP|api-ms-win-crt') { throw 'the exe depends on the Visual C++ runtime' }
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $dist = New-Item -ItemType Directory dist
+          Copy-Item target\release\gamepass-downloader.exe $dist
+          $hash = (Get-FileHash dist\gamepass-downloader.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  gamepass-downloader.exe" | Out-File -Encoding ascii dist\SHA256SUMS.txt
+          $extra = @()
+          if ($env:GITHUB_REF_NAME -match '-') { $extra += '--prerelease' }   # v0.2.0-rc1 and the like
+          gh release create $env:GITHUB_REF_NAME dist\gamepass-downloader.exe dist\SHA256SUMS.txt `
+            --title "gamepass-downloader $($env:GITHUB_REF_NAME.TrimStart('v'))" --generate-notes --verify-tag @extra
+          if ($LASTEXITCODE -ne 0) { throw 'gh release create failed' }
